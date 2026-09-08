@@ -19,8 +19,9 @@ You are that agent.
 
 ## Setup (first time on a fresh run)
 
-1. Agree a run tag with the human and create a branch
-   `fractalsearch/<tag>` from master, or pickup from an existing branch.
+1. Pick a run tag and create a local branch `fractalsearch/<tag>` from main, or
+   continue an existing local branch. This Colab checkout has no Git remote: commit
+   locally, but do not add a remote or push anywhere.
 2. Read the in-scope files for full context:
    - `harness/groundtruth.py` — the target (read-only).
    - `harness/interface.py` — the `Solution` contract (read-only).
