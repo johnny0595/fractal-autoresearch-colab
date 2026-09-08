@@ -1,19 +1,26 @@
-# fractal autoresearch
+# 🌀 fractalsearch 🌀
 
-A standalone Colab lab for letting a coding agent research better neural approximations of the Mandelbrot set.
+[Open the thin Colab runner](https://colab.research.google.com/github/johnny0595/fractal-autoresearch-colab/blob/main/fractalsearch_colab.ipynb)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/johnny0595/fractal-autoresearch-colab/blob/main/fractal_autoresearch_colab.ipynb)
+This fork keeps the project as normal, visible source files. The notebook only installs
+the dependencies, shows the research instructions and baseline, runs an experiment,
+opens the original dashboard, and explains how to hand the same directory to an agent.
+Nothing is packed into a hidden setup cell.
 
-The notebook creates a small `fractalsearch`-style repository inside the Colab VM:
+Can AI Agents do AI research?
 
-- fixed target, evaluator, seed, metric, and training budget;
-- one candidate solution for the agent to edit;
-- automatic JSONL results, source snapshots, best-solution tracking, and previews;
-- a progress chart in the notebook;
-- short setup commands for Codex CLI or Claude Code.
 
-Use a GPU runtime. Scores are local to this practice project and should only be compared across the same GPU type.
+This project attempts to facilitate this strange loop on a toy ML problem:
+How well can a function approximator fit the mandelbrot set? 
+It is a low-dimensional curve-fitting problem, like fitting an image, but this image has infinite detail and complexity at every scale. 
+This has been a [pet project of mine](https://github.com/MaxRobinsonTheGreat/mandelbrotnn) for a long time.
 
-## Credit
 
-Adapted for Colab from [MaxRobinsonTheGreat/fractalsearch](https://github.com/MaxRobinsonTheGreat/fractalsearch), which is inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
+As the human overseer, you can edit the prompt file AGENT.MD to guide bot behavior, rather than writing any code directly. Spin up any AI agent, point it at AGENT.MD, talk with it for a bit, and let 'er rip. You can monitor performance through your webbrowser at `localhost:8000`.
+
+
+This project is directly adapted form Karpathy's [autoresearch](https://github.com/karpathy/autoresearch). 
+All code was AI generated with claude (this is human written btw). 
+
+> [!WARNING]  
+> I will not be managing this repo or accepting PRs.

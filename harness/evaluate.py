@@ -1,0 +1,232 @@
+"""Evaluate one candidate solution and log the result.
+
+Usage:
+    uv run python -m harness.evaluate solutions/fourier.py
+    uv run python -m harness.evaluate solutions/fourier.py --note "order=64, 6 layers"
+
+What it does (fixed, immutable protocol):
+    1. Load the Solution from the given module file.
+    2. Train it via Solution.fit() with a TRAIN_BUDGET_S target (default 300s = 5 min).
+       A hard SIGALRM backstop kills the run at HARD_KILL_S (default 600s = 10 min).
+    3. Score it: MSE against the ground truth over a FIXED dense evaluation grid.
+       (Lower MSE is better. This is THE metric.)
+    4. Save the trained artifact + a preview render under runs/<run_id>/.
+    5. Append a structured record to runs.jsonl and print a human summary.
+
+The metric and the eval grid live here and in groundtruth.py — they are the ground
+truth. Do not modify them mid-run; doing so makes logged results incomparable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import traceback
+
+import torch
+
+from harness import groundtruth as gt
+from harness.interface import FitContext, Solution
+
+# --- Fixed evaluation protocol constants --------------------------------------
+TRAIN_BUDGET_S = 300        # target training time handed to fit() (5 minutes)
+HARD_KILL_S = 600           # absolute backstop; run is killed past this (10 minutes)
+# 4K-class dense evaluation grid, aspect-correct so coordinate-space pixels are SQUARE.
+# The view window is 3.5 x 2.2 (aspect ~1.59, NOT 1:1), so a square grid would distort
+# the fractal. Width is anchored to the 4K UHD width; height is derived from the window
+# aspect. -> 3840 x 2414 ~= 9.3M points.
+EVAL_RESX = 3840
+EVAL_RESY = round(EVAL_RESX / gt.ASPECT)
+SEED = 1234
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNS_DIR = os.path.join(ROOT, "runs")
+RUNS_LOG = os.path.join(ROOT, "runs.jsonl")
+
+
+class _HardTimeout(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise _HardTimeout()
+
+
+def load_solution(path: str) -> Solution:
+    """Import a solutions/*.py file and return its Solution instance."""
+    path = os.path.abspath(path)
+    spec = importlib.util.spec_from_file_location("candidate_solution", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if hasattr(module, "SOLUTION"):
+        sol = module.SOLUTION
+    elif hasattr(module, "build"):
+        sol = module.build()
+    else:
+        raise AttributeError(
+            f"{path} must define a module-level `SOLUTION` or a `build()` factory.")
+    if not isinstance(sol, Solution):
+        raise TypeError(f"{path}: SOLUTION/build() must return a harness Solution.")
+    return sol
+
+
+def eval_targets(device):
+    """Ground-truth values on the dense eval grid, computed fresh every run.
+
+    Intentionally NOT cached: the compute is cheap on GPU next to the 5-minute training
+    budget, and a live computation can never go stale when the target definition in
+    groundtruth.py (view window, smooth(), MAX_DEPTH, ...) changes."""
+    coords = gt.make_grid(EVAL_RESX, EVAL_RESY, device=device)
+    targets = gt.mandelbrot(coords)
+    return coords, targets
+
+
+@torch.no_grad()
+def predict_batched(sol: Solution, coords: torch.Tensor, batch=200_000) -> torch.Tensor:
+    outs = []
+    for i in range(0, coords.shape[0], batch):
+        outs.append(sol.predict(coords[i:i + batch]).reshape(-1).to(coords.device))
+    return torch.cat(outs)
+
+
+def score(preds: torch.Tensor, targets: torch.Tensor) -> dict:
+    err = preds - targets
+    mse = torch.mean(err * err).item()
+    mae = torch.mean(err.abs()).item()
+    # Cap PSNR to a finite value (a perfect fit gives mse=0 -> inf, which is not valid
+    # JSON and anything above ~60 dB is effectively perfect anyway).
+    psnr = 100.0 if mse <= 1e-12 else min(100.0, 10.0 * math.log10(1.0 / mse))
+    # boundary-weighted error: emphasize the hard, high-detail region (target near,
+    # but not at, the set). Reported only; the PRIMARY metric is mse.
+    w = ((targets > 0.05) & (targets < 0.999)).float()
+    bmse = (torch.sum(w * err * err) / w.sum().clamp_min(1)).item()
+    return {"mse": mse, "mae": mae, "psnr": psnr, "boundary_mse": bmse}
+
+
+def git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "nogit"
+
+
+def save_artifacts(preds: torch.Tensor, targets: torch.Tensor, run_dir: str):
+    """Render the prediction and abs-error PNGs at the FULL eval resolution, reusing the
+    tensors already computed for scoring — no recompute, and pixel-exact with the metric.
+
+    The two layers the dashboard compares are written as standalone, pixel-aligned PNGs
+    so the UI can switch between them while preserving zoom/pan. Ground truth is identical
+    for every run, so it is NOT saved per-run — the dashboard renders it via
+    /api/groundtruth (same aspect ratio, so it overlays cleanly at any display size)."""
+    try:
+        from PIL import Image
+        import numpy as np
+        from harness import colormap as cm
+        H, W = EVAL_RESY, EVAL_RESX
+        pred = preds.reshape(H, W).cpu().numpy()
+        truth = targets.reshape(H, W).cpu().numpy()
+        err = np.abs(pred - truth)
+        err = err / max(err.max(), 1e-8)
+        Image.fromarray(cm.apply(pred, cm.VALUE_CMAP)).save(os.path.join(run_dir, "prediction.png"))
+        Image.fromarray(cm.apply(err, cm.ERROR_CMAP)).save(os.path.join(run_dir, "error.png"))
+    except Exception as e:
+        print(f"(artifact render skipped: {e})", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("solution", help="path to a solutions/*.py file")
+    ap.add_argument("--note", default="", help="extra description for the log")
+    ap.add_argument("--budget", type=float, default=TRAIN_BUDGET_S)
+    args = ap.parse_args()
+
+    torch.manual_seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    sol = load_solution(args.solution)
+    record = {
+        "run_id": run_id,
+        "timestamp": time.time(),
+        "solution": os.path.relpath(os.path.abspath(args.solution), ROOT),
+        "name": getattr(sol, "name", "unnamed"),
+        "description": (getattr(sol, "description", "") + (" | " + args.note if args.note else "")).strip(" |"),
+        "commit": git_commit(),
+        "device": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
+        "status": "running",
+        "train_seconds": 0.0,
+        "mse": None, "mae": None, "psnr": None, "boundary_mse": None,
+    }
+
+    # Snapshot the solution source into the run dir. The trained .pt is intentionally
+    # NOT saved — these are small-scale experiments and a full-scale retrain happens
+    # outside this loop, so what's worth preserving (and committing) is the *recipe*,
+    # not the weights. The copy captures exactly what ran, even if the file later
+    # changes; it may lack imported deps, but it beats nothing for reproducing a result.
+    try:
+        shutil.copy2(os.path.abspath(args.solution),
+                     os.path.join(run_dir, os.path.basename(args.solution)))
+    except Exception as e:
+        print(f"(solution source copy skipped: {e})", flush=True)
+
+    ctx = FitContext(device=device, time_budget_s=args.budget, seed=SEED)
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(int(HARD_KILL_S))
+    t0 = time.monotonic()
+    try:
+        sol.fit(ctx)
+        record["train_seconds"] = time.monotonic() - t0
+        signal.alarm(0)
+
+        coords, targets = eval_targets(device)
+        preds = predict_batched(sol, coords)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        record.update(score(preds, targets))
+        record["status"] = "ok"
+
+        save_artifacts(preds, targets, run_dir)
+
+    except _HardTimeout:
+        record["status"] = "timeout"
+        record["train_seconds"] = time.monotonic() - t0
+    except Exception:
+        record["status"] = "crash"
+        record["train_seconds"] = time.monotonic() - t0
+        record["error"] = traceback.format_exc()
+        print(record["error"], flush=True)
+    finally:
+        signal.alarm(0)
+
+    with open(os.path.join(run_dir, "result.json"), "w") as f:
+        json.dump(record, f, indent=2)
+    with open(RUNS_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    print("---")
+    print(f"run_id:        {record['run_id']}")
+    print(f"solution:      {record['solution']}")
+    print(f"status:        {record['status']}")
+    print(f"train_seconds: {record['train_seconds']:.1f}")
+    if record["status"] == "ok":
+        print(f"mse:           {record['mse']:.8f}")
+        print(f"mae:           {record['mae']:.6f}")
+        print(f"psnr_db:       {record['psnr']:.2f}")
+        print(f"boundary_mse:  {record['boundary_mse']:.8f}")
+    sys.exit(0 if record["status"] == "ok" else 1)
+
+
+if __name__ == "__main__":
+    main()

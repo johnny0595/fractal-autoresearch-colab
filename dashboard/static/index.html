@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>fractalsearch · control panel</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --mut:#8b949e;
+          --accent:#58a6ff; --good:#3fb950; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); display:flex; flex-direction:column;
+         font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:16px; flex:0 0 auto; }
+  header h1 { font-size:16px; margin:0; letter-spacing:.5px; }
+  header .stat { color:var(--mut); font-size:12px; }
+  header .stat b { color:var(--fg); }
+
+  /* Vertical-display layout: leaderboard (left) + selected solution (right) on top,
+     the progress graph spanning the full width underneath. */
+  .wrap { flex:1 1 auto; min-height:0; display:grid; gap:16px; padding:16px;
+          grid-template-columns: minmax(220px, 1fr) minmax(0, 1.6fr);
+          grid-template-rows: minmax(0, 1.7fr) minmax(180px, 1fr);
+          grid-template-areas: "board solution" "graph graph"; }
+  #panel-board { grid-area:board; } #panel-solution { grid-area:solution; }
+  #panel-graph { grid-area:graph; }
+
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+           padding:14px; display:flex; flex-direction:column; min-height:0; }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px;
+              color:var(--mut); margin:0 0 10px; flex:0 0 auto; }
+
+  /* Leaderboard: header pinned, body scrolls when it overflows the fixed height. */
+  .tablescroll { flex:1 1 auto; min-height:0; overflow-y:auto; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line);
+           white-space:nowrap; }
+  th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--panel); z-index:1; }
+  tr.best td { color:var(--good); }
+  tr.sel td { background:#1f2630; }
+  /* Drag-scrub the leaderboard without selecting row text. */
+  #rows { user-select:none; -webkit-user-select:none; }
+  tbody tr:hover td { background:#1c222b; cursor:pointer; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+
+  /* Selected-solution image viewer with persistent zoom/pan. */
+  .seg { display:flex; gap:6px; margin-bottom:10px; flex:0 0 auto; }
+  .seg button { flex:1; padding:5px 8px; font:inherit; font-size:12px; cursor:pointer;
+                background:transparent; color:var(--mut); border:1px solid var(--line);
+                border-radius:6px; }
+  .seg button.on { color:var(--fg); border-color:var(--accent); background:#1a2433; }
+  .viewer { flex:1 1 auto; min-height:0; position:relative; overflow:hidden;
+            border:1px solid var(--line); border-radius:6px; background:#000;
+            cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none; }
+  .viewer.drag { cursor:grabbing; }
+  .vp { position:absolute; top:0; left:0; transform-origin:0 0; will-change:transform; }
+  .vp img { position:absolute; top:0; left:0; width:100%; height:100%; display:block;
+            image-rendering:pixelated; opacity:0; transition:opacity .08s;
+            -webkit-user-drag:none; user-drag:none; pointer-events:none; }
+  .vp img.on { opacity:1; }
+  /* Code layer: fills the viewer frame exactly where the image was, scrolls on overflow,
+     and overlays the (hidden) image group. Never touches the image zoom/pan transform. */
+  #code-view { position:absolute; inset:0; margin:0; overflow:auto; display:none;
+               padding:12px 14px; background:#0d1117; cursor:auto; user-select:text;
+               -webkit-user-select:text; font:12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+               white-space:pre; color:var(--fg); tab-size:4; }
+  #code-view.on { display:block; }
+  #code-view .c-com { color:#8b949e; font-style:italic; }
+  #code-view .c-str { color:#a5d6ff; }
+  #code-view .c-kw  { color:#ff7b72; }
+  #code-view .c-bi  { color:#79c0ff; }
+  #code-view .c-num { color:#79c0ff; }
+  #code-view .c-dec { color:#d2a8ff; }
+  .stats { flex:0 0 auto; display:flex; flex-wrap:wrap; gap:4px 18px; margin-top:10px;
+           font-size:12px; }
+  .stats .kv { color:var(--mut); } .stats .kv b { color:var(--fg); font-weight:600; }
+
+  /* flex-basis:0 (not auto) so the canvas's intrinsic height attribute — which we set
+     to H*dpr for the backing store — does NOT feed back into the flex layout. With
+     basis:auto the chart visibly resized on the first redraw. */
+  canvas { width:100%; flex:1 1 0; min-height:0; display:block; }
+  .muted { color:var(--mut); font-size:12px; }
+  /* Chart footer: note on the left, "display most recent" control on the bottom right. */
+  .chart-footer { flex:0 0 auto; display:flex; justify-content:space-between;
+                  align-items:center; gap:12px; margin-top:6px; }
+  .chart-ctl { color:var(--mut); font-size:11px; display:flex; align-items:center;
+               gap:6px; white-space:nowrap; }
+  .chart-ctl select { background:#0d1117; color:var(--fg); border:1px solid var(--line);
+                      border-radius:6px; padding:2px 6px; cursor:pointer;
+                      font:11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .follow { margin-left:8px; font-size:11px; padding:2px 8px; border-radius:10px;
+            border:1px solid var(--line); background:transparent; color:var(--mut);
+            cursor:pointer; vertical-align:middle; }
+  .follow.on { color:var(--good); border-color:var(--good); }
+  .pill { padding:1px 7px; border-radius:10px; font-size:11px; }
+  .ok{background:#1a3a24;color:var(--good);} .crash{background:#3a1a1a;color:#f85149;}
+  .timeout{background:#3a311a;color:#d29922;} .running{background:#1a2a3a;color:var(--accent);}
+</style>
+</head>
+<body>
+<header>
+  <h1>🌀 fractalsearch</h1>
+  <span class="stat">runs <b id="s-count">–</b></span>
+  <span class="stat">scored <b id="s-ok">–</b></span>
+  <span class="stat">best MSE <b id="s-best">–</b></span>
+  <span class="stat" style="margin-left:auto" id="s-time">–</span>
+</header>
+
+<div class="wrap">
+  <div class="panel" id="panel-board">
+    <h2>Leaderboard
+      <span style="float:right; font-weight:400;">
+        <button id="sort-score" class="follow on" onclick="setSort('score')">lowest MSE</button>
+        <button id="sort-latest" class="follow" onclick="setSort('latest')">latest</button>
+      </span>
+    </h2>
+    <div class="tablescroll">
+      <table>
+        <thead><tr><th>run</th><th>name</th><th class="num">MSE</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-solution">
+    <h2>Selected solution <span id="sel-name" class="muted"></span>
+        <button id="follow-btn" class="follow on" onclick="toggleFollow()">▶ following latest</button></h2>
+    <div class="seg" id="seg">
+      <button data-layer="gt" class="on" onclick="setLayer('gt')">ground truth</button>
+      <button data-layer="pred" onclick="setLayer('pred')">prediction</button>
+      <button data-layer="err" onclick="setLayer('err')">abs error</button>
+      <button data-layer="code" onclick="setLayer('code')">code</button>
+    </div>
+    <div class="viewer" id="viewer">
+      <div class="vp" id="vp">
+        <img id="img-gt"  alt="ground truth" draggable="false"/>
+        <img id="img-pred" alt="prediction" draggable="false"/>
+        <img id="img-err"  alt="abs error" draggable="false"/>
+      </div>
+      <pre id="code-view"></pre>
+    </div>
+    <div class="stats" id="sel-stats"></div>
+  </div>
+
+  <div class="panel" id="panel-graph">
+    <h2>Best-MSE over time</h2>
+    <canvas id="chart" width="800" height="200"></canvas>
+    <div class="chart-footer">
+      <div class="muted" id="chart-note"></div>
+      <div style="display:flex; gap:16px; align-items:center;">
+      <label class="chart-ctl">Scale
+        <select id="chart-scale" onchange="setChartScale(this.value)">
+          <option value="linear" selected>linear</option>
+          <option value="log">log</option>
+        </select>
+      </label>
+      <label class="chart-ctl">Display most recent
+        <select id="chart-window" onchange="setChartWindow(this.value)">
+          <option value="10">10</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="all" selected>all</option>
+        </select>
+      </label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let selected = null, runs = [], follow = true, lastFrontier = [], sortMode = "score";
+let bestId = null, layer = "gt";
+// Intrinsic size of every preview layer (aspect_grid(512) -> 815x512). All three
+// layers share these dimensions, so the viewer transform is the same for each.
+const IMG_W = 815, IMG_H = 512;
+// Persistent absolute view transform, shared across every image and every run.
+// userAdjusted = the user has zoomed/panned, so stop auto-refitting on resize.
+const view = { scale: 1, tx: 0, ty: 0 };
+let userAdjusted = false;
+// Chart hover state + last-drawn geometry (set by drawChart) for hit-testing.
+let hoverIdx = null, chartGeo = null;
+// How many of the most recent solutions the chart shows ("all" or a number). The window
+// is applied at draw time relative to the current run count, so it tracks new runs.
+let chartWindow = "all";
+// Y-axis scale: "linear" pins the baseline to 0; "log" plots log10(MSE), which matches
+// the multiplicative nature of MSE progress on this target (equivalent to PSNR in dB).
+let chartScale = "linear";
+
+function setChartWindow(v){
+  chartWindow = (v==="all") ? "all" : parseInt(v, 10);
+  drawChart(lastFrontier);
+}
+
+function setChartScale(v){
+  chartScale = v;
+  drawChart(lastFrontier);
+}
+
+function fmt(x, d=6){ return (x==null) ? "–" : Number(x).toFixed(d); }
+
+function setSort(mode){
+  sortMode = mode;
+  document.getElementById("sort-score").classList.toggle("on", mode==="score");
+  document.getElementById("sort-latest").classList.toggle("on", mode==="latest");
+  renderRows();
+}
+
+function toggleFollow(){
+  follow = !follow;
+  if (follow){ const latest = runs.length ? runs[runs.length-1].run_id : null;
+               if (latest){ selected = latest; renderSelected(); markRows(); drawChart(lastFrontier); } }
+  updateFollowBtn();
+}
+
+function updateFollowBtn(){
+  const b = document.getElementById("follow-btn");
+  b.classList.toggle("on", follow);
+  b.textContent = follow ? "▶ following latest" : "⏸ pinned — click to follow";
+}
+
+function update(data){
+  runs = data.runs;
+  lastFrontier = data.frontier;
+  document.getElementById("s-count").textContent = data.count;
+  document.getElementById("s-ok").textContent = data.ok_count;
+  document.getElementById("s-time").textContent = new Date().toLocaleTimeString();
+
+  const ok = runs.filter(r => r.status==="ok" && r.mse!=null);
+  const best = ok.length ? ok.reduce((a,b)=>a.mse<b.mse?a:b) : null;
+  document.getElementById("s-best").textContent = best ? fmt(best.mse,6) : "–";
+
+  if (follow && data.latest_run_id) selected = data.latest_run_id;
+  else if (selected===null && best) selected = best.run_id;
+
+  bestId = best && best.run_id;
+  renderRows();
+  drawChart(lastFrontier);
+  renderSelected();
+}
+
+function renderRows(){
+  const sorted = (sortMode==="latest")
+    ? [...runs].reverse()
+    : [...runs].sort((a,b)=>{
+        const am=(a.mse==null)?Infinity:a.mse, bm=(b.mse==null)?Infinity:b.mse;
+        return am-bm;
+      });
+  const rows = sorted.map(r => {
+    const cls = [r.run_id===bestId?"best":"", r.run_id===selected?"sel":""].join(" ");
+    return `<tr class="${cls}" onclick="select('${r.run_id}')">
+      <td>${r.run_id}</td><td>${r.name||""}</td>
+      <td class="num">${fmt(r.mse,6)}</td></tr>`;
+  }).join("");
+  document.getElementById("rows").innerHTML = rows;
+}
+
+function select(id){ selected = id; follow = false; updateFollowBtn();
+  renderSelected(); markRows(); drawChart(lastFrontier); }
+
+function markRows(){
+  document.querySelectorAll("#rows tr").forEach(tr=>{
+    const id = tr.getAttribute("onclick").match(/'([^']+)'/)[1];
+    tr.classList.toggle("sel", id===selected);
+  });
+}
+
+// --- image viewer -----------------------------------------------------------
+function setLayer(l){
+  layer = l;
+  document.querySelectorAll("#seg button").forEach(b =>
+    b.classList.toggle("on", b.dataset.layer===l));
+  // Image layers share the zoom/pan transform; the code layer overlays the frame.
+  // Toggling layers never touches `view`, so the image keeps its zoom/pan when you
+  // switch back from code (or any other layer).
+  ["gt","pred","err"].forEach(k =>
+    document.getElementById("img-"+k).classList.toggle("on", k===l));
+  document.getElementById("code-view").classList.toggle("on", l==="code");
+  if (l==="code") renderCode();
+}
+
+function applyView(){
+  document.getElementById("vp").style.transform =
+    `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`;
+}
+// Scale that makes the whole image fit inside the frame (min of the two axes).
+function fitScale(){
+  const v = document.getElementById("viewer");
+  return Math.min(v.clientWidth / IMG_W, v.clientHeight / IMG_H) || 1;
+}
+// Fit the entire image in the frame and center it (letterboxed on the slack axis).
+function fitView(){
+  const v = document.getElementById("viewer");
+  const s = fitScale();
+  view.scale = s;
+  view.tx = (v.clientWidth  - IMG_W * s) / 2;
+  view.ty = (v.clientHeight - IMG_H * s) / 2;
+  applyView();
+}
+function resetView(){ userAdjusted = false; fitView(); }
+
+function setupViewer(){
+  const viewer = document.getElementById("viewer"), vp = document.getElementById("vp");
+  vp.style.width = IMG_W + "px"; vp.style.height = IMG_H + "px";
+  fitView();
+  // Re-fit on resize until the user takes manual control of zoom/pan.
+  new ResizeObserver(() => { if (!userAdjusted) fitView(); }).observe(viewer);
+
+  viewer.addEventListener("wheel", e => {
+    if (layer==="code") return;   // let the code panel scroll naturally
+    e.preventDefault();
+    const rect = viewer.getBoundingClientRect();
+    const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    const fit = fitScale();
+    const ns = Math.min(40 * fit, Math.max(fit, view.scale * factor));
+    if (ns <= fit * 1.001){ resetView(); return; }  // zoomed all the way out -> snap to fit
+    const k = ns / view.scale;
+    view.tx = cx - (cx - view.tx) * k;   // zoom about the cursor
+    view.ty = cy - (cy - view.ty) * k;
+    view.scale = ns; userAdjusted = true;
+    applyView();
+  }, { passive:false });
+
+  let dragging = false, px = 0, py = 0;
+  viewer.addEventListener("pointerdown", e => {
+    if (layer==="code") return;   // don't drag-pan while showing code
+    dragging = true; px = e.clientX; py = e.clientY; userAdjusted = true;
+    viewer.classList.add("drag"); viewer.setPointerCapture(e.pointerId);
+  });
+  viewer.addEventListener("pointermove", e => {
+    if (!dragging) return;
+    view.tx += e.clientX - px; view.ty += e.clientY - py;
+    px = e.clientX; py = e.clientY; applyView();
+  });
+  const end = () => { dragging = false; viewer.classList.remove("drag"); };
+  viewer.addEventListener("pointerup", end);
+  viewer.addEventListener("pointercancel", end);
+  viewer.addEventListener("dblclick", () => { if (layer!=="code") resetView(); });
+  viewer.addEventListener("dragstart", e => e.preventDefault());
+}
+
+// Ground truth is identical for every run -> load it exactly once.
+let gtLoaded = false;
+function renderSelected(){
+  const r = runs.find(x=>x.run_id===selected);
+  if (!gtLoaded){ document.getElementById("img-gt").src = "/api/groundtruth";
+                  gtLoaded = true; }
+  const pred = document.getElementById("img-pred"), err = document.getElementById("img-err");
+  const stats = document.getElementById("sel-stats");
+  if (!r){ pred.removeAttribute("src"); err.removeAttribute("src");
+           stats.innerHTML = ""; document.getElementById("sel-name").textContent = ""; return; }
+  pred.src = "/api/prediction/"+r.run_id+"?t="+r.run_id;
+  err.src  = "/api/error/"+r.run_id+"?t="+r.run_id;
+  if (layer==="code") renderCode();   // keep code in sync when the selection updates
+  document.getElementById("sel-name").textContent = `· ${r.name||""} (${r.run_id})`;
+  const kv = (k,v)=>`<span class="kv">${k} <b>${v}</b></span>`;
+  stats.innerHTML =
+    kv("status", `<span class="pill ${r.status}">${r.status}</span>`) +
+    kv("MSE", fmt(r.mse,6)) + kv("MAE", fmt(r.mae,4)) +
+    kv("PSNR", fmt(r.psnr,1)) + kv("boundary", fmt(r.boundary_mse,6)) +
+    kv("train s", fmt(r.train_seconds,0));
+}
+
+// --- code layer -------------------------------------------------------------
+// Self-contained Python highlighter (no external libs, to match the project's
+// dependency-free ethos). Tokenize comments / strings / decorators / numbers /
+// identifiers in one left-to-right pass; HTML-escape every emitted slice.
+const PY_KW = new Set(("False None True and as assert async await break class continue "
+  + "def del elif else except finally for from global if import in is lambda nonlocal "
+  + "not or pass raise return try while with yield").split(" "));
+const PY_BI = new Set(("print range len int float str list dict set tuple bool abs min max "
+  + "sum round super self cls enumerate zip map filter open isinstance getattr hasattr "
+  + "torch nn np").split(" "));
+function escHtml(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function highlightPython(src){
+  const re = /(#[^\n]*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(@\w+)|(\b\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?\b)|([A-Za-z_]\w*)/g;
+  let out = "", last = 0, m;
+  while ((m = re.exec(src)) !== null){
+    out += escHtml(src.slice(last, m.index));
+    last = re.lastIndex;
+    if (m[1])      out += `<span class="c-com">${escHtml(m[1])}</span>`;
+    else if (m[2]) out += `<span class="c-str">${escHtml(m[2])}</span>`;
+    else if (m[3]) out += `<span class="c-dec">${escHtml(m[3])}</span>`;
+    else if (m[4]) out += `<span class="c-num">${escHtml(m[4])}</span>`;
+    else {
+      const w = m[5];
+      if (PY_KW.has(w))      out += `<span class="c-kw">${w}</span>`;
+      else if (PY_BI.has(w)) out += `<span class="c-bi">${w}</span>`;
+      else                   out += w;
+    }
+  }
+  out += escHtml(src.slice(last));
+  return out;
+}
+let codeRunId = null;
+async function renderCode(){
+  const el = document.getElementById("code-view");
+  const r = runs.find(x=>x.run_id===selected);
+  if (!r){ el.textContent = ""; codeRunId = null; return; }
+  if (codeRunId === r.run_id) return;   // already showing this run's source
+  codeRunId = r.run_id;
+  el.innerHTML = `<span class="c-com"># loading…</span>`;
+  try {
+    const txt = await (await fetch("/api/code/"+r.run_id+"?t="+r.run_id)).text();
+    if (codeRunId !== r.run_id) return;  // selection changed mid-fetch
+    el.innerHTML = highlightPython(txt);
+    el.scrollTop = 0;
+  } catch(e){
+    el.innerHTML = `<span class="c-com"># (no source snapshot for this run)</span>`;
+  }
+}
+
+function drawChart(frontier){
+  const c = document.getElementById("chart"), ctx = c.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const rect = c.getBoundingClientRect();
+  const W = Math.max(1, Math.round(rect.width)), H = Math.max(1, Math.round(rect.height));
+  if (c.width !== W*dpr || c.height !== H*dpr){ c.width = W*dpr; c.height = H*dpr; }
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+
+  // Window to the most recent N solutions (the dropdown). start is recomputed from the
+  // current run count each draw, so the view tracks new solutions as they arrive.
+  const start = (chartWindow==="all") ? 0 : Math.max(0, frontier.length - chartWindow);
+  const pts = frontier.map((v,i)=>[i,v]).filter(p=>p[1]!=null && p[0]>=start);
+  if (pts.length<1){ document.getElementById("chart-note").textContent="no scored runs yet"; return; }
+  const ys=pts.map(p=>p[1]);
+  const xmin=start, xmax=Math.max(start+1,frontier.length-1);
+  const log = chartScale==="log";
+  // Linear: baseline pinned to 0, ymax zooms to the window. Log: span the window's own
+  // log10(MSE) range (MSE is always > 0 here; clamp guards a hypothetical perfect fit).
+  const tf = log ? (v=>Math.log10(Math.max(v,1e-12))) : (v=>v);
+  const yloVal=Math.min(...ys), yhiVal=Math.max(...ys);
+  const ymin = log ? tf(yloVal) : 0, ymax = tf(yhiVal);
+  const pad=44;
+  const X=i=>pad+(i-xmin)/(xmax-xmin||1)*(W-2*pad);
+  const Y=v=>H-pad-( (tf(v)-ymin)/((ymax-ymin)||1) )*(H-2*pad);
+  const firstIdx = frontier.findIndex((v,i)=>v!=null && i>=start);
+  chartGeo = {pad, W, H, xmin, xmax, firstIdx, X, Y};   // for hover hit-testing
+  ctx.strokeStyle="#30363d"; ctx.lineWidth=1; ctx.beginPath();
+  ctx.moveTo(pad,H-pad); ctx.lineTo(W-pad,H-pad); ctx.moveTo(pad,pad); ctx.lineTo(pad,H-pad);
+  ctx.stroke();
+  ctx.strokeStyle="#3fb950"; ctx.lineWidth=2; ctx.beginPath();
+  pts.forEach((p,k)=>{ const x=X(p[0]),y=Y(p[1]); k?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke();
+
+  // One green dot per solution, sitting on the best-MSE frontier.
+  pts.forEach(p=>{
+    ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 3, 0, 2*Math.PI);
+    ctx.fillStyle="#3fb950"; ctx.fill();
+    ctx.lineWidth=1.5; ctx.strokeStyle="#0d1117"; ctx.stroke();
+  });
+
+  const selIdx = runs.findIndex(r => r.run_id===selected);
+  if (selIdx>=start && frontier[selIdx]!=null){   // only if the selected run is in-window
+    const x=X(selIdx), y=Y(frontier[selIdx]);
+    ctx.strokeStyle="#30363d"; ctx.setLineDash([3,3]); ctx.lineWidth=1; ctx.beginPath();
+    ctx.moveTo(x,H-pad); ctx.lineTo(x,y); ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(x,y,7,0,2*Math.PI);   // selected = biggest dot
+    ctx.fillStyle="#58a6ff"; ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle="#0d1117"; ctx.stroke();
+  }
+
+  // Hover marker: dot on the frontier at the run nearest the cursor, plus its name.
+  if (hoverIdx!=null && hoverIdx>=start && frontier[hoverIdx]!=null){
+    const x=X(hoverIdx), y=Y(frontier[hoverIdx]), r=runs[hoverIdx];
+    ctx.beginPath(); ctx.arc(x,y,4,0,2*Math.PI);
+    ctx.fillStyle="#d29922"; ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle="#0d1117"; ctx.stroke();
+    const label = `${r?(r.name||""):""} (${r?r.run_id:""})`;
+    ctx.font="11px monospace"; const tw=ctx.measureText(label).width;
+    let lx = x + 8; if (lx + tw > W-4) lx = x - 8 - tw;   // flip near the right edge
+    const ly = Math.max(pad+10, y - 8);
+    ctx.fillStyle="rgba(13,17,23,.85)"; ctx.fillRect(lx-3, ly-11, tw+6, 15);
+    ctx.fillStyle="#e6edf3"; ctx.fillText(label, lx, ly+1);
+  }
+
+  ctx.fillStyle="#8b949e"; ctx.font="10px monospace";
+  ctx.fillText(yhiVal.toExponential(2), 4, pad);
+  ctx.fillText(log ? yloVal.toExponential(2) : "0", 4, H-pad+4);
+  const shown = frontier.length - start;
+  const scope = (chartWindow==="all") ? `${frontier.length} runs`
+                                      : `most recent ${shown} of ${frontier.length} runs`;
+  document.getElementById("chart-note").textContent =
+    `best MSE ${yhiVal===0?"–":yloVal.toExponential(3)} over ${scope}`;
+}
+
+// Map a cursor x within the chart to the nearest run index that has a frontier value.
+function chartIndexAt(clientX){
+  const g = chartGeo; if (!g || g.firstIdx<0) return null;
+  const c = document.getElementById("chart");
+  const mx = clientX - c.getBoundingClientRect().left;
+  const frac = (mx - g.pad) / Math.max(1, g.W - 2*g.pad);
+  let idx = Math.round(g.xmin + frac * (g.xmax - g.xmin));
+  return Math.min(lastFrontier.length-1, Math.max(g.firstIdx, idx));
+}
+
+function setupChartHover(){
+  const c = document.getElementById("chart");
+  let scrub = false;
+  // Select the run under the cursor; only re-render when it actually changes.
+  const selectAt = clientX => {
+    const idx = chartIndexAt(clientX);
+    if (idx==null || !runs[idx]) return;
+    hoverIdx = idx;
+    if (runs[idx].run_id !== selected) select(runs[idx].run_id);
+    else drawChart(lastFrontier);
+  };
+  c.addEventListener("pointerdown", e => {
+    if (chartIndexAt(e.clientX)==null) return;
+    scrub = true; c.setPointerCapture(e.pointerId);
+    c.style.cursor = "grabbing"; selectAt(e.clientX);
+  });
+  c.addEventListener("pointermove", e => {
+    if (scrub){ selectAt(e.clientX); return; }   // drag: selection follows the cursor
+    const idx = chartIndexAt(e.clientX);          // plain hover: just the marker/label
+    if (idx !== hoverIdx){ hoverIdx = idx; c.style.cursor = idx!=null?"pointer":"default";
+                           drawChart(lastFrontier); }
+  });
+  const end = () => { if (scrub){ scrub = false; c.style.cursor = "pointer"; } };
+  c.addEventListener("pointerup", end);
+  c.addEventListener("pointercancel", end);
+  c.addEventListener("mouseleave", () => { if (!scrub){ hoverIdx=null; drawChart(lastFrontier); } });
+}
+
+// Drag-scrub the leaderboard: press on a solution and drag across rows to continuously
+// update the selection (and the image/code panel), so you can watch the fit change.
+function setupBoardScrub(){
+  const tb = document.getElementById("rows");
+  let scrub = false;
+  const idOf = el => {
+    const tr = el && el.closest ? el.closest("tr") : null;
+    const a = tr && tr.getAttribute("onclick");
+    const m = a && a.match(/'([^']+)'/);
+    return m ? m[1] : null;
+  };
+  tb.addEventListener("pointerdown", e => {
+    const id = idOf(e.target);
+    if (!id) return;
+    e.preventDefault();             // don't begin a text selection while scrubbing
+    scrub = true;
+    if (id !== selected) select(id);
+  });
+  // No pointer capture on the tbody — capturing would stop pointerover firing on the
+  // other rows. Without it, moving with the button held still hits each row underneath.
+  tb.addEventListener("pointerover", e => {
+    if (!scrub) return;
+    const id = idOf(e.target);
+    if (id && id !== selected) select(id);
+  });
+  const end = () => { scrub = false; };
+  window.addEventListener("pointerup", end);
+  window.addEventListener("pointercancel", end);
+}
+
+let pollTimer = null;
+function startPolling(){
+  if (pollTimer) return;
+  const tick = async () => { try { update(await (await fetch("/api/runs")).json()); } catch(e){} };
+  tick(); pollTimer = setInterval(tick, 3000);
+}
+function startStream(){
+  const es = new EventSource("/api/stream");
+  es.onmessage = (e) => { if (pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+                          try { update(JSON.parse(e.data)); } catch(err){} };
+  es.onerror = () => { startPolling(); };
+}
+
+window.addEventListener("resize", () => drawChart(lastFrontier));
+setupViewer();
+setupChartHover();
+setupBoardScrub();
+setLayer("gt");
+updateFollowBtn();
+startStream();
+</script>
+</body>
+</html>
